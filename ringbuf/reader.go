@@ -61,15 +61,18 @@ func (v *View) Release() error {
 		return nil
 	}
 
-	v.r.mu.Lock()
-	defer v.r.mu.Unlock()
+	r := v.r
+	v.r = nil
 
-	if v.r.ring == nil {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.ring == nil {
 		return ErrClosed
 	}
 
-	atomic.StoreUintptr(v.r.ring.cons_pos, v.nextCons)
-	v.r.viewInFlight = false
+	atomic.StoreUintptr(r.ring.cons_pos, v.nextCons)
+	r.viewInFlight = false
 	return nil
 }
 

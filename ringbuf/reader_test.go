@@ -465,3 +465,38 @@ func TestReadViewIntoReuse(t *testing.T) {
 	}
 	qt.Assert(t, qt.IsNil(view.Release()))
 }
+
+func TestReleaseViewIsIdempotent(t *testing.T) {
+	testutils.SkipOnOldKernel(t, "5.8", "BPF ring buffer")
+
+	prog, events := mustOutputSamplesProg(t,
+		sampleMessage{size: 5, flags: 0},
+		sampleMessage{size: 7, flags: 0},
+	)
+	mustRun(t, prog)
+
+	rd, err := NewReader(events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rd.Close()
+
+	view1, err := rd.ReadView()
+	qt.Assert(t, qt.IsNil(err))
+	qt.Assert(t, qt.Equals(len(view1.Sample), 5))
+
+	// Release the first view.
+	qt.Assert(t, qt.IsNil(view1.Release()))
+
+	// Read the second record.
+	view2, err := rd.ReadView()
+	qt.Assert(t, qt.IsNil(err))
+	qt.Assert(t, qt.Equals(len(view2.Sample), 7))
+
+	// Releasing view1 again after view2 is obtained should be a no-op.
+	// This ensures an old view's Release doesn't corrupt state.
+	qt.Assert(t, qt.IsNil(view1.Release()))
+
+	// Verify view2 is still valid by releasing it successfully.
+	qt.Assert(t, qt.IsNil(view2.Release()))
+}
