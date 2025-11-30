@@ -384,3 +384,64 @@ func BenchmarkReadInto(b *testing.B) {
 		}
 	}
 }
+
+func TestPeekRequiresConsume(t *testing.T) {
+	testutils.SkipOnOldKernel(t, "5.8", "BPF ring buffer")
+
+	prog, events := mustOutputSamplesProg(t,
+		sampleMessage{size: 5, flags: 0},
+		sampleMessage{size: 7, flags: 0},
+	)
+	mustRun(t, prog)
+
+	rd, err := NewReader(events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rd.Close()
+
+	view1, err := rd.Peek()
+	qt.Assert(t, qt.IsNil(err))
+	qt.Assert(t, qt.Equals(len(view1.Sample), 5))
+	rd.Consume(&view1)
+
+	view2, err := rd.Peek()
+	qt.Assert(t, qt.IsNil(err))
+	qt.Assert(t, qt.Equals(len(view2.Sample), 7))
+	rd.Consume(&view2)
+}
+
+func TestPeekIntoReuse(t *testing.T) {
+	testutils.SkipOnOldKernel(t, "5.8", "BPF ring buffer")
+
+	prog, events := mustOutputSamplesProg(t,
+		sampleMessage{size: 5, flags: 0},
+		sampleMessage{size: 7, flags: 0},
+	)
+	mustRun(t, prog)
+
+	rd, err := NewReader(events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rd.Close()
+
+	var view View
+	if err := rd.PeekInto(&view); err != nil {
+		t.Fatalf("first PeekInto failed: %v", err)
+	}
+	if got := len(view.Sample); got != 5 {
+		t.Fatalf("expected length 5, got %d", got)
+	}
+
+	// Reuse same View struct.
+	rd.Consume(&view)
+
+	if err := rd.PeekInto(&view); err != nil {
+		t.Fatalf("second PeekInto failed: %v", err)
+	}
+	if got := len(view.Sample); got != 7 {
+		t.Fatalf("expected length 7, got %d", got)
+	}
+	rd.Consume(&view)
+}
