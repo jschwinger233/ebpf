@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -14,9 +15,10 @@ import (
 )
 
 var (
-	ErrClosed = os.ErrClosed
-	errEOR    = errors.New("end of ring")
-	errBusy   = errors.New("sample not committed yet")
+	ErrClosed    = os.ErrClosed
+	errEOR       = errors.New("end of ring")
+	errBusy      = errors.New("sample not committed yet")
+	ErrViewInUse = errors.New("ringbuf: view already in use")
 )
 
 // ringbufHeader from 'struct bpf_ringbuf_hdr' in kernel/bpf/ringbuf.c
@@ -46,18 +48,44 @@ type Record struct {
 	Remaining int
 }
 
+type View struct {
+	Sample    []byte
+	Remaining int
+
+	r        *Reader
+	nextCons uintptr
+}
+
+func (v *View) Release() error {
+	if v == nil || v.r == nil {
+		return nil
+	}
+
+	v.r.mu.Lock()
+	defer v.r.mu.Unlock()
+
+	if v.r.ring == nil {
+		return ErrClosed
+	}
+
+	atomic.StoreUintptr(v.r.ring.cons_pos, v.nextCons)
+	v.r.viewInFlight = false
+	return nil
+}
+
 // Reader allows reading bpf_ringbuf_output
 // from user space.
 type Reader struct {
 	poller *poller
 
 	// mu protects read/write access to the Reader structure
-	mu         sync.Mutex
-	ring       *ringbufEventRing
-	haveData   bool
-	deadline   time.Time
-	bufferSize int
-	pendingErr error
+	mu           sync.Mutex
+	ring         *ringbufEventRing
+	haveData     bool
+	deadline     time.Time
+	bufferSize   int
+	pendingErr   error
+	viewInFlight bool
 }
 
 // NewReader creates a new BPF ringbuf reader.
@@ -151,6 +179,53 @@ func (r *Reader) ReadInto(rec *Record) error {
 		return fmt.Errorf("ringbuffer: %w", ErrClosed)
 	}
 
+	return r.readLocked(func() error {
+		return r.ring.readRecord(rec)
+	})
+}
+
+// ReadView returns a zero-copy view into the next record in the ring buffer.
+//
+// The returned View must be released by calling View.Release once the data has
+// been consumed. Only a single View can be outstanding per Reader at a time;
+// attempting to call ReadView again before releasing the previous View returns
+// ErrViewInUse.
+func (r *Reader) ReadView() (View, error) {
+	var v View
+	err := r.ReadViewInto(&v)
+	return v, err
+}
+
+// ReadViewInto is like ReadView except that it allows reusing the provided View.
+func (r *Reader) ReadViewInto(view *View) error {
+	if view == nil {
+		return fmt.Errorf("ringbuffer: nil View")
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.ring == nil {
+		return fmt.Errorf("ringbuffer: %w", ErrClosed)
+	}
+	if r.viewInFlight {
+		return ErrViewInUse
+	}
+
+	return r.readLocked(func() error {
+		err := r.ring.readView(view)
+		if err != nil {
+			return err
+		}
+		view.r = r
+		r.viewInFlight = true
+		return nil
+	})
+}
+
+// readLocked drives the polling / data-availability loop shared by Record and View reads.
+// It must be invoked with r.mu held.
+func (r *Reader) readLocked(read func() error) error {
 	for {
 		if !r.haveData {
 			if pe := r.pendingErr; pe != nil {
@@ -171,7 +246,7 @@ func (r *Reader) ReadInto(rec *Record) error {
 		}
 
 		for {
-			err := r.ring.readRecord(rec)
+			err := read()
 			// Not using errors.Is which is quite a bit slower
 			// For a tight loop it might make a difference
 			if err == errBusy {

@@ -41,16 +41,17 @@ func (rr *ringReader) AvailableBytes() uint64 {
 	return uint64(prod - cons)
 }
 
-// Read a record from an event ring.
-func (rr *ringReader) readRecord(rec *Record) error {
+// readSample returns a zero-copy view into the next sample, together with the
+// consumer position that should be stored to release the data.
+func (rr *ringReader) readSample() (sample []byte, remaining int, nextCons uintptr, err error) {
 	prod := atomic.LoadUintptr(rr.prod_pos)
 	cons := atomic.LoadUintptr(rr.cons_pos)
 
 	for {
 		if remaining := prod - cons; remaining == 0 {
-			return errEOR
+			return nil, 0, 0, errEOR
 		} else if remaining < sys.BPF_RINGBUF_HDR_SZ {
-			return fmt.Errorf("read record header: %w", io.ErrUnexpectedEOF)
+			return nil, 0, 0, fmt.Errorf("read record header: %w", io.ErrUnexpectedEOF)
 		}
 
 		// read the len field of the header atomically to ensure a happens before
@@ -58,14 +59,14 @@ func (rr *ringReader) readRecord(rec *Record) error {
 		// without BPF_RINGBUF_BUSY_BIT before the written data is visible.
 		// See https://github.com/torvalds/linux/blob/v6.8/kernel/bpf/ringbuf.c#L484
 		start := cons & rr.mask
-		len := atomic.LoadUint32((*uint32)((unsafe.Pointer)(&rr.ring[start])))
-		header := ringbufHeader{Len: len}
+		hdrLen := atomic.LoadUint32((*uint32)((unsafe.Pointer)(&rr.ring[start])))
+		header := ringbufHeader{Len: hdrLen}
 
 		if header.isBusy() {
 			// the next sample in the ring is not committed yet so we
 			// exit without storing the reader/consumer position
 			// and start again from the same position.
-			return errBusy
+			return nil, 0, 0, errBusy
 		}
 
 		cons += sys.BPF_RINGBUF_HDR_SZ
@@ -73,7 +74,7 @@ func (rr *ringReader) readRecord(rec *Record) error {
 		// Data is always padded to 8 byte alignment.
 		dataLenAligned := uintptr(internal.Align(header.dataLen(), 8))
 		if remaining := prod - cons; remaining < dataLenAligned {
-			return fmt.Errorf("read sample data: %w", io.ErrUnexpectedEOF)
+			return nil, 0, 0, fmt.Errorf("read sample data: %w", io.ErrUnexpectedEOF)
 		}
 
 		start = cons & rr.mask
@@ -87,15 +88,46 @@ func (rr *ringReader) readRecord(rec *Record) error {
 			continue
 		}
 
-		if n := header.dataLen(); cap(rec.RawSample) < n {
-			rec.RawSample = make([]byte, n)
-		} else {
-			rec.RawSample = rec.RawSample[:n]
+		dataLen := header.dataLen()
+		startInt := int(start)
+		end := startInt + dataLen
+		if end > len(rr.ring) {
+			return nil, 0, 0, fmt.Errorf("read sample data: %w", io.ErrUnexpectedEOF)
 		}
 
-		copy(rec.RawSample, rr.ring[start:])
-		rec.Remaining = int(prod - cons)
-		atomic.StoreUintptr(rr.cons_pos, cons)
-		return nil
+		return rr.ring[startInt:end], int(prod - cons), cons, nil
 	}
+}
+
+// Read a record from an event ring.
+func (rr *ringReader) readRecord(rec *Record) error {
+	sample, remaining, nextCons, err := rr.readSample()
+	if err != nil {
+		return err
+	}
+
+	if n := len(sample); cap(rec.RawSample) < n {
+		rec.RawSample = make([]byte, n)
+	} else {
+		rec.RawSample = rec.RawSample[:n]
+	}
+
+	copy(rec.RawSample, sample)
+	rec.Remaining = remaining
+	atomic.StoreUintptr(rr.cons_pos, nextCons)
+	return nil
+}
+
+// readView is the zero-copy variant of readRecord. It leaves advancing the
+// consumer position to the caller.
+func (rr *ringReader) readView(view *View) error {
+	sample, remaining, nextCons, err := rr.readSample()
+	if err != nil {
+		return err
+	}
+
+	view.Sample = sample
+	view.Remaining = remaining
+	view.nextCons = nextCons
+	return nil
 }

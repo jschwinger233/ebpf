@@ -384,3 +384,84 @@ func BenchmarkReadInto(b *testing.B) {
 		}
 	}
 }
+
+func TestReadViewRequiresRelease(t *testing.T) {
+	testutils.SkipOnOldKernel(t, "5.8", "BPF ring buffer")
+
+	prog, events := mustOutputSamplesProg(t, sampleMessage{size: 5, flags: 0})
+	mustRun(t, prog)
+
+	rd, err := NewReader(events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rd.Close()
+
+	availBefore := rd.AvailableBytes()
+
+	view, err := rd.ReadView()
+	qt.Assert(t, qt.IsNil(err))
+	if len(view.Sample) != 5 {
+		t.Fatalf("expected view of length 5, got %d", len(view.Sample))
+	}
+	// Consumer position is not advanced until release.
+	qt.Assert(t, qt.Equals(rd.AvailableBytes(), availBefore))
+
+	// A second view without releasing the first should fail.
+	_, err = rd.ReadView()
+	if !errors.Is(err, ErrViewInUse) {
+		t.Fatalf("expected ErrViewInUse, got %v", err)
+	}
+
+	consumed := ringbufHeaderSize + internal.Align(5, 8)
+	err = view.Release()
+	qt.Assert(t, qt.IsNil(err))
+
+	qt.Assert(t, qt.Equals(rd.AvailableBytes(), availBefore-consumed))
+
+	// Second release should be a no-op.
+	qt.Assert(t, qt.IsNil(view.Release()))
+
+	// Produce another event and ensure we can read again.
+	mustRun(t, prog)
+	view, err = rd.ReadView()
+	qt.Assert(t, qt.IsNil(err))
+	qt.Assert(t, qt.IsNil(view.Release()))
+}
+
+func TestReadViewIntoReuse(t *testing.T) {
+	testutils.SkipOnOldKernel(t, "5.8", "BPF ring buffer")
+
+	prog, events := mustOutputSamplesProg(t,
+		sampleMessage{size: 5, flags: 0},
+		sampleMessage{size: 7, flags: 0},
+	)
+	mustRun(t, prog)
+
+	rd, err := NewReader(events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rd.Close()
+
+	var view View
+	if err := rd.ReadViewInto(&view); err != nil {
+		t.Fatalf("first ReadViewInto failed: %v", err)
+	}
+	if got := len(view.Sample); got != 5 {
+		t.Fatalf("expected length 5, got %d", got)
+	}
+
+	// Reuse same View struct.
+	if err := view.Release(); err != nil {
+		t.Fatalf("release failed: %v", err)
+	}
+
+	if err := rd.ReadViewInto(&view); err != nil {
+		t.Fatalf("second ReadViewInto failed: %v", err)
+	}
+	if got := len(view.Sample); got != 7 {
+		t.Fatalf("expected length 7, got %d", got)
+	}
+	qt.Assert(t, qt.IsNil(view.Release()))
+}
